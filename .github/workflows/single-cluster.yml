@@ -1,6 +1,7 @@
 name: E2E Single-Cluster Telemetry
 
 on:
+  workflow_dispatch:
   # schedule:
   #   # Run everyday day at 9:00 AM
   #   - cron: '0 9 * * *'
