@@ -23,8 +23,11 @@ env:
   GOARCH: amd64
   CGO_ENABLED: 0
   SETUP_GO_VERSION: '^1.19'
+  HOST_NAME: foo  # for `start` script
+  TOKEN: ${{ secrets.TOKEN }}
 
 jobs:
+
   e2e-telemetry-test:
     runs-on: ubuntu-latest
 
@@ -32,9 +35,12 @@ jobs:
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
+          path: main
+
       - uses: actions/setup-go@v3
         with:
           go-version: ${{ env.SETUP_GO_VERSION }}
+
       - uses: actions/cache@v3
         with:
           path: |
@@ -43,90 +49,83 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
+
       - name: Install Ginkgo CLI
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.1
-      - name: Test env
-        run: "echo Here comes GOARCH: ${{ env.GOARCH }}"
+
+      - name: Install HTTP testing tool
+        run: |
+          # apt update && apt install httpie
+          pip install httpie
+
       - name: Build Binaries
         run: |
+          cd main
           go build -o bin/hello-${{ env.GOARCH }} -x -v .
-      - name: Build Docker Images
-        run: |
-          docker build -f Dockerfile -t pseidensal/hello-world:dev --build-arg ARCH=${{ env.GOARCH }} .
+
+
       - name: Provision k3d Cluster
         uses: AbsaOSS/k3d-action@v2
         with:
-          cluster-name: 'upstream'
+          cluster-name: telemetry-host
           args: >-
-            -p "80:80@agent:0:direct"
-            -p "443:443@agent:0:direct"
             --api-port 6443
-            --agents 3
             --network "nw01"
-      # - name: Provision k3d Downstream Cluster
-      #   uses: AbsaOSS/k3d-action@v2
-      #   with:
-      #     cluster-name: 'downstream'
-      #     args: >-
-      #       -p "81:80@agent:0:direct"
-      #       -p "444:443@agent:0:direct"
-      #       --api-port 6644
-      #       --agents 1
-      #       --network "nw01"
-      - name: Import Images Into k3d
+
+      - uses: actions/checkout@v3
+        with:
+          repository: p-se/rancher-telemetry-devel
+          path: telemetry-devel
+
+      - name: Install Rancher
         run: |
-          k3d image import pseidensal/hello-world:dev -c upstream
-      # - name: Set Up Tmate Debug Session
-      #   if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_tmate == 'true' }}
-      #   uses: mxschmitt/action-tmate@v3
-      #   timeout-minutes: 15
-      #   with:
-      #     limit-access-to-actor: true
-      # - name: Deploy Fleet
-      #   run: |
-      #     kubectl config use-context k3d-upstream
-      #     ./.github/scripts/deploy-fleet.sh
-      # - name: Deploy and Register Downstream Fleet
-      #   run: |
-      #     kubectl apply -f - <<EOF
-      #     apiVersion: "fleet.cattle.io/v1alpha1"
-      #     kind: ClusterRegistrationToken
-      #     metadata:
-      #       name: second-token
-      #       namespace: fleet-local
-      #     spec:
-      #       ttl: 12h
-      #     EOF
-      #     { grep -q -m 1 "second-token"; kill $!; } < <(kubectl get secrets -n fleet-local -l "fleet.cattle.io/managed=true" -w)
+          cd telemetry-devel
+          source ./start && install-rancher
 
-      #     token=$(kubectl get secret -n fleet-local second-token -o go-template='{{index .data "values" | base64decode}}' | yq eval .token -)
-      #     ca=$(kubectl get secret -n cattle-fleet-system fleet-controller-bootstrap-token -o go-template='{{index .data "ca.crt" | base64decode}}')
+          for i in {0..5}; do
+            ip=$(
+              kubectl get -A ingress -o json |
+                jq -r '.items[0].status.loadBalancer.ingress[0].ip'
+            )
 
-      #     kubectl config use-context k3d-downstream
-      #     helm -n cattle-fleet-system upgrade --install --create-namespace --wait fleet-agent charts/fleet-agent \
-      #       --set-string labels.env=test \
-      #       --set apiServerCA="$ca" \
-      #       --set apiServerURL="https://172.18.0.1.omg.howdoi.website:6443" \
-      #       --set clusterNamespace="fleet-local" \
-      #       --set token="$token"
-      # - name: E2E tests for Examples
-      #   env:
-      #     FLEET_E2E_NS: fleet-local
-      #     FLEET_E2E_CLUSTER: k3d-upstream
-      #     FLEET_E2E_CLUSTER_DOWNSTREAM: k3d-downstream
-      #   run: |
-      #     kubectl config use-context k3d-upstream
-      #     ginkgo e2e/multi-cluster
-      # - name: Dump Failed Environment
-      #   if: failure()
-      #   run: |
-      #     ./.github/scripts/dump-failed-k3ds.sh
-      # - name: Upload Logs
-      #   uses: actions/upload-artifact@v3
-      #   if: failure()
-      #   with:
-      #     name: gha-fleet-mc-e2e-logs-${{ github.sha }}-${{ github.run_id }}
-      #     path: |
-      #       tmp/*.json
-      #       tmp/*.log
-      #     retention-days: 2
+            if http --check-status --verify=no GET "https://${ip}" Host:${HOST_NAME} ; then
+              >&2 echo "Rancher installation verified successfully"
+              exit 0
+            fi
+          done
+
+          >&2 echo "Rancher installation test failed"
+          exit 1
+
+      - name: Install PostgreSQL
+        run: |
+          cd telemetry-devel
+          source ./start && install-postgres
+
+      - name: Install Telemetry Server
+        run: |
+          cd telemetry-devel
+          source ./start && install-telemetry-server
+
+      - name: Install Telemetry Client
+        run: |
+          cd telemetry-devel
+          source ./start && install-telemetry-client
+
+      - name: Install InfluxDB
+        run: |
+          cd telemetry-devel
+          source ./start && install-influx
+
+      - name: Configure Rancher
+        run: |
+          cd telemetry-devel
+          source ./start
+          CLUSTER_IP=$(get-cluster-ip)
+          init-base "admin"
+
+      - name: Build Docker images
+        run: ''
+
+      - name: Upload Docker images
+        run: ''
